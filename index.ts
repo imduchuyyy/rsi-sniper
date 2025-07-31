@@ -7,11 +7,11 @@ import TelegramBot from 'node-telegram-bot-api';
 const TELEGRAM_TOKEN = process.env.TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || TELEGRAM_CHAT_ID;
-const rsiPeriod = 24;
+const rsiPeriod = 15;
 const batchSize = 20;
 const delayMs = 1000;
-const rsiUpper = 70;
-const rsiLower = 30;
+const rsiUpper = 80;
+const rsiLower = 20;
 const numberCoins = 100; // adjust here
 
 // ====== SETUP ======
