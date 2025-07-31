@@ -1,65 +1,57 @@
 import axios from 'axios';
 import WebSocket from 'ws';
-import { RSI } from 'technicalindicators';
 import TelegramBot from 'node-telegram-bot-api';
 
 // ====== CONFIG ======
 const TELEGRAM_TOKEN = process.env.TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || TELEGRAM_CHAT_ID;
-const rsiPeriod = 24;
-const batchSize = 20;
+const volumeMultiplier = 2; // 2x average
+const candleLimit = 30;
 const delayMs = 1000;
-const rsiUpper = 70;
-const rsiLower = 30;
-const numberCoins = 100; // adjust here
+const batchSize = 20;
+const interval = '15m'; // M15
+const numberCoins = 100;
 
 // ====== SETUP ======
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
-const closePrices: Record<string, number[]> = {};
-const lastAlert: Record<string, { type: 'high' | 'low' | null }> = {};
+const volumeHistory: Record<string, number[]> = {};
 const alertQueue: { text: string }[] = [];
 
-// Throttle Telegram messages to 1 per 1.1 seconds
+// ====== TYPES ======
+interface KlineRest {
+  0: number;
+  5: string; // volume
+  4: string; // close price
+}
+
+interface Ticker24h {
+  symbol: string;
+  quoteVolume: string;
+}
+
+interface KlineWs {
+  x: boolean;
+  v: string; // volume
+  c: string; // close price
+}
+
+// ====== ALERT SYSTEM ======
 setInterval(() => {
-  const next = alertQueue.shift();
-  if (next) {
-    bot.sendMessage(TELEGRAM_CHAT_ID, next.text, {
+  const msg = alertQueue.shift();
+  if (msg) {
+    bot.sendMessage(TELEGRAM_CHAT_ID, msg.text, {
       parse_mode: 'Markdown',
       disable_web_page_preview: true,
     }).catch(console.error);
   }
 }, 1100);
 
-// ====== TYPES ======
-interface Ticker24h {
-  symbol: string;
-  quoteVolume: string;
-}
-
-interface KlineRest {
-  0: number;
-  4: string; // close price
-}
-
-interface KlineWs {
-  t: number;
-  c: string;
-  x: boolean;
-}
-
-// ====== UTILS ======
-function sleep(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function sendRsiAlert(symbol: string, rsi: number, price?: number) {
-  const status = rsi > rsiUpper ? '🔴' : '🟢';
-  const alertType = rsi > rsiUpper ? 'high' : 'low';
-  const base = symbol.toUpperCase().replace("USDT", "");
-  const message = `${status} *#${base}* RSI ${alertType}: *${rsi.toFixed(2)}* at $${price?.toFixed(2)}`;
-  alertQueue.push({ text: message });
-  console.log(`📥 Queued alert: ${message}`);
+function sendVolumeAlert(symbol: string, volumeUSD: number, avgUSD: number) {
+  const base = symbol.toUpperCase().replace('USDT', '');
+  const msg = `📢 *#${base}* high volume spike: *$${(volumeUSD / 1_000).toFixed(4)}k*`;
+  alertQueue.push({ text: msg });
+  console.log(`📥 Queued volume alert: ${msg}`);
 }
 
 // ====== CORE LOGIC ======
@@ -79,88 +71,81 @@ async function getTopSymbols(limit = 1000): Promise<string[]> {
     .map(t => t.symbol.toLowerCase());
 }
 
-async function preloadCloses(symbol: string): Promise<void> {
+async function preloadVolumes(symbol: string): Promise<void> {
   try {
-    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=1m&limit=100`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${candleLimit}`;
     const res = await axios.get<KlineRest[]>(url);
-    closePrices[symbol] = res.data.map(k => parseFloat(k[4]));
-    console.log(`✅ Preloaded ${symbol.toUpperCase()}`);
+    const volumes = res.data.map(k => parseFloat(k[5]) * parseFloat(k[4])); // volume * close = approx USD
+    volumeHistory[symbol] = volumes;
+    console.log(`✅ Preloaded volume for ${symbol.toUpperCase()}`);
   } catch {
     console.warn(`⚠️ Failed to preload ${symbol.toUpperCase()}`);
   }
 }
 
 async function preloadAll(symbols: string[]) {
-  console.log(`⏳ Preloading closes for ${symbols.length} symbols in batches...`);
   for (let i = 0; i < symbols.length; i += batchSize) {
     const batch = symbols.slice(i, i + batchSize);
-    await Promise.all(batch.map(preloadCloses));
-    await sleep(delayMs);
+    await Promise.all(batch.map(preloadVolumes));
+    await new Promise(resolve => setTimeout(resolve, delayMs));
   }
-  console.log('✅ All preloading done.');
 }
 
 function buildCombinedStreamUrl(symbols: string[]) {
-  const streams = symbols.map(s => `${s}@kline_1m`).join('/');
+  const streams = symbols.map(s => `${s}@kline_${interval}`).join('/');
   return `wss://stream.binance.com:9443/stream?streams=${streams}`;
 }
 
 function startWebSocket(symbols: string[]) {
-  const wsUrl = buildCombinedStreamUrl(symbols);
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(buildCombinedStreamUrl(symbols));
 
-  ws.on('open', () => {
-    console.log('🔌 WebSocket connected to Binance');
-  });
+  ws.on('open', () => console.log('🔌 WebSocket connected'));
 
-  ws.on('message', async (raw) => {
+  ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
       const symbol = msg.data.s.toLowerCase();
       const k: KlineWs = msg.data.k;
+
       if (!k.x) return;
 
       const close = parseFloat(k.c);
-      const arr = closePrices[symbol] ||= [];
-      arr.push(close);
-      if (arr.length > 100) arr.shift();
+      const volume = parseFloat(k.v);
+      const volumeUSD = volume * close;
 
-      if (arr.length >= rsiPeriod) {
-        const rsi = RSI.calculate({ values: arr, period: rsiPeriod });
-        const latest = rsi.at(-1);
-        if (latest !== undefined) {
-          const alert = lastAlert[symbol] || { type: null };
-          if (latest > rsiUpper && alert.type !== 'high') {
-            sendRsiAlert(symbol, latest, close);
-            lastAlert[symbol] = { type: 'high' };
-          } else if (latest < rsiLower && alert.type !== 'low') {
-            sendRsiAlert(symbol, latest, close);
-            lastAlert[symbol] = { type: 'low' };
-          } else if (latest >= rsiLower && latest <= rsiUpper) {
-            lastAlert[symbol] = { type: null };
-          }
-        }
+      const history = volumeHistory[symbol] ||= [];
+      const avg = history.reduce((a, b) => a + b, 0) / history.length;
+
+      console.log(`📊 ${symbol.toUpperCase()} - Volume: $${(volumeUSD / 1_000).toFixed(2)}k, Avg: $${(avg / 1_000).toFixed(2)}k`);
+
+      if (
+        history.length >= candleLimit &&
+        volumeUSD >= volumeMultiplier * avg &&
+        volumeUSD >= 50_000 // must be at least $50k
+      ) {
+        sendVolumeAlert(symbol, volumeUSD, avg);
       }
+
+      history.push(volumeUSD);
+      if (history.length > candleLimit) history.shift();
+
     } catch (err) {
-      console.error('❌ WebSocket message error:', err);
+      console.error('❌ WS message error:', err);
     }
   });
 
-  ws.on('error', (err) => {
-    console.error('❌ WebSocket connection error:', err);
-  });
+  ws.on('error', err => console.error('❌ WebSocket error:', err));
 }
 
-// ====== ENTRY POINT ======
+// ====== MAIN ======
 async function main() {
   try {
     const symbols = await getTopSymbols(numberCoins);
     await preloadAll(symbols);
-    await bot.sendMessage(ADMIN_CHAT_ID, `🤖 RSI bot started. Tracking ${symbols.length} coins.`);
-
+    await bot.sendMessage(ADMIN_CHAT_ID, `🤖 Volume alert bot started for ${symbols.length} pairs.`);
     startWebSocket(symbols);
   } catch (err) {
-    console.error('❌ Bot startup error:', err);
+    console.error('❌ Startup error:', err);
   }
 }
 
